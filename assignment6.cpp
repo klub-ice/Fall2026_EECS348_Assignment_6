@@ -7,13 +7,13 @@
     Revised by: Logan Sigg, 10/29/2026
     Revised by: Zoey Spies, 11/13/2026
     Assignment 5 modifications: output format, invalid-puzzle reporting, faster cell selection
-    Assignment 6 modifications: one shared solutions.txt with "Puzzle: x" headers, unexpected-character error, popcount table, single toString per solution
-    Sources for revisions: Claude (Anthropic); original collaborators listed below
+    Assignment 6 modifications: one shared solutions.txt with "Puzzle: x" headers, unexpected-character error, popcount table, single toString per solution,
+                                constraint propagation (naked singles) merged into the fewest-candidates search with an allocation-free undo trail
+    Sources for revisions: Claude (Anthropic) wrote the output, parsing and search changes; Gemini (Google) suggested constraint propagation, which was re-implemented here
     Purpose:  Solve Sudoku puzzles using a backtracking algorithm.
     Original collaborators: Copilot, Claude, EECS 348 notes and slides, EECS 388 notes and slides, geeksforgeeks.org, stackoverflow.com
 */
 
-#include <bitset> // for counting bits in a bitmask
 #include <cctype> // for std::tolower
 #include <cstdlib> // for std::strtoull
 #include <fstream> // for file I/O
@@ -120,6 +120,12 @@ public:
         return table[m & 1023u]; // revised with Claude: constant-time lookup (candidate masks only use bits 1..9)
     }
 
+    int lowestDigit(unsigned m) const { // revised with Claude: returns the smallest digit 1..9 whose bit is set in m
+        for (int v = 1; v <= SIZE; ++v) // revised with Claude: test digits in ascending order
+            if (m & (1u << v)) return v; // revised with Claude: first set bit is the digit
+        return 0; // revised with Claude: empty mask has no digit
+    }
+
     std::string toString(char blank = '_') const { // returns a string representation of the board, using blank for empty cells
         std::ostringstream os; // create a string stream to build the string representation
         for (int r = 0; r < SIZE; ++r) { // for each row
@@ -169,12 +175,13 @@ public:
 class Solver { // implements a backtracking algorithm to find all solutions to a Sudoku puzzle
 public:
     Solver(Board& board, unsigned long long limit = 0) // constructor initializes the solver with a reference to the board and an optional limit on the number of solutions to find
-        : board_(board), limit_(limit), count_(0), limitHit_(false), listener_(NULL) {}
+        : board_(board), limit_(limit), count_(0), limitHit_(false), listener_(NULL), top_(0) {} // revised with Claude: trail starts empty
 
     unsigned long long solveAll(SolutionListener* listener) { // finds all valid solutions and reports each one to the listener
         count_ = 0; // reset the count before solving
         limitHit_ = false; // reset the limit flag before solving
         listener_ = listener; // store the listener for callback reporting
+        top_ = 0; // revised with Claude: reset the undo trail for a fresh solve
         if (board_.isValid()) search(); // begin the recursive search only if the board is currently valid
         return count_; // return the total number of solutions found
     }
@@ -190,31 +197,50 @@ private:
     bool limitHit_; // flag set when the search hits the solver limit
     SolutionListener* listener_; // callback object that receives each solved board
 
-    void search() { // recursively chooses the next empty cell and tries each valid digit
-        int bestR = NO_CELL, bestC = NO_CELL, bestCount = MORE_THAN_ANY_CELL; // best empty cell found so far and its candidate count
-        unsigned bestMask = 0; // bitmask of valid digits for the best cell
+    struct Move { int r, c; }; // revised with Claude (idea from Gemini): a cell filled by propagation, remembered so it can be undone
+    Move trail_[Board::SIZE * Board::SIZE]; // revised with Claude: one shared undo stack; at most 81 cells can ever be forced, so it never grows or allocates
+    int top_; // revised with Claude: number of entries currently on the trail
 
-        for (int r = 0; r < Board::SIZE; ++r) { // scan each row
-            for (int c = 0; c < Board::SIZE; ++c) { // scan each column
-                if (!board_.isEmpty(r, c)) continue; // skip filled cells
-                unsigned m = board_.candidates(r, c); // get the candidate bitmask for this empty cell
-                int n = board_.countBits(m); // count how many values could legally go here
-                if (n < bestCount) { // keep the cell with the fewest candidates to prune the search faster
-                    bestCount = n; // save the candidate count
-                    bestR = r; // save the row index
-                    bestC = c; // save the column index
-                    bestMask = m; // save the valid candidate mask
-                    if (n == 0) return; // no valid moves exist, so backtrack immediately
-                    if (n == 1) break; // revised with Claude: one candidate is the best possible cell, so stop scanning this row
+    void undoTo(int mark) { // revised with Claude: clears every cell forced since the trail had `mark` entries
+        while (top_ > mark) { // revised with Claude: pop newest first so masks are restored in reverse order
+            --top_; // revised with Claude: move to the newest entry
+            board_.remove(trail_[top_].r, trail_[top_].c); // revised with Claude: empty the cell and restore its masks
+        }
+    }
+
+    void search() { // recursive search: propagate forced cells, then branch on the cell with the fewest candidates
+        const int mark = top_; // revised with Claude: remember where this level's forced moves start on the trail
+        int bestR, bestC, bestCount; // revised with Claude: best branching cell found in the final pass
+        unsigned bestMask; // revised with Claude: its candidate mask
+        bool progress; // revised with Claude: true when a pass filled at least one cell
+
+        do { // revised with Claude: repeat passes until a full pass forces nothing
+            progress = false; // revised with Claude: assume nothing will be forced this pass
+            bestR = bestC = NO_CELL; // revised with Claude: no branching cell chosen yet
+            bestCount = MORE_THAN_ANY_CELL; // revised with Claude: larger than any real candidate count
+            bestMask = 0; // revised with Claude: no candidates recorded yet
+            for (int r = 0; r < Board::SIZE; ++r) { // scan each row
+                for (int c = 0; c < Board::SIZE; ++c) { // scan each column
+                    if (!board_.isEmpty(r, c)) continue; // skip filled cells
+                    unsigned m = board_.candidates(r, c); // legal digits for this empty cell
+                    int n = board_.countBits(m); // how many legal digits there are
+                    if (n == 0) { undoTo(mark); return; } // dead end: some cell has no legal digit, so undo and backtrack
+                    if (n == 1) { // naked single: the digit is forced (idea from Gemini)
+                        board_.place(r, c, board_.lowestDigit(m)); // revised with Claude: fill the forced cell
+                        trail_[top_].r = r; trail_[top_].c = c; ++top_; // revised with Claude: record it so it can be undone
+                        progress = true; // revised with Claude: masks changed, so another pass is needed
+                    } else if (n < bestCount) { // otherwise remember the cell with the fewest candidates
+                        bestCount = n; bestR = r; bestC = c; bestMask = m; // revised with Claude: save its count, position and mask
+                    }
                 }
             }
-            if (bestCount == 1) break; // revised with Claude: a forced cell was found, so skip the remaining rows as well
-        }
+        } while (progress); // revised with Claude: in the final pass nothing was forced, so best* is up to date
 
-        if (bestR == NO_CELL) { // no empty cells remain, so the board is a complete solution
+        if (bestR == NO_CELL) { // no empty cell remains, so the board is a complete solution
             ++count_; // increment the total number of solutions found
             if (listener_) listener_->onSolution(board_, count_); // report the solution to the listener
             if (limit_ != 0 && count_ >= limit_) limitHit_ = true; // stop searching if the user limit has been reached
+            undoTo(mark); // revised with Claude: remove this level's forced cells before returning
             return; // return to the previous recursive level
         }
 
@@ -223,8 +249,9 @@ private:
             board_.place(bestR, bestC, v); // place the candidate on the board
             search(); // recurse deeper to continue solving
             board_.remove(bestR, bestC); // undo the placement before trying the next candidate
-            if (limitHit_) return; // stop recursing once the limit has been reached
+            if (limitHit_) break; // stop recursing once the limit has been reached
         }
+        undoTo(mark); // revised with Claude: remove this level's forced cells before returning to the caller
     }
 };
 
