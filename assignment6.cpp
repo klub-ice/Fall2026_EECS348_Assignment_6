@@ -130,7 +130,7 @@ public:
         std::ostringstream os; // create a string stream to build the string representation
         for (int r = 0; r < SIZE; ++r) { // for each row
             for (int c = 0; c < SIZE; ++c) // for each column
-                os << (c ? " " : "") << (cells_[r][c] ? static_cast<char>('0' + cells_[r][c]) : blank); // revised with Claude: separate cells with a space but leave no trailing space
+                os << (cells_[r][c] ? static_cast<char>('0' + cells_[r][c]) : blank) << ' '; // output the cell value or blank followed by a space, matching the puzzle file rows
             os << '\n'; // output a newline after each row
         }
         return os.str(); // return the string representation of the board
